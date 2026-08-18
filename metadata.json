@@ -1,0 +1,6 @@
+{
+  "name": "HOA Document Assistant",
+  "description": "AI assistant that connects to Google Drive and parses PDFs, documents, spreadsheets, and JPG photos of meeting minutes or financials into indexed text for intelligent governance analysis.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
