@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { 
   Folder, 
+  FolderPlus, 
   FolderCheck, 
   ChevronRight, 
   Search, 
@@ -8,12 +9,13 @@ import {
   X, 
   Check, 
   Loader2, 
-  HardDrive,
+  ArrowLeft, 
+  ExternalLink,
+  ShieldCheck,
   AlertCircle,
-  FolderOpen,
-  ArrowLeft,
-  Sparkles,
-  Layers
+  HardDrive,
+  FolderTree,
+  Sparkles
 } from 'lucide-react';
 import { DriveFolder, FolderBreadcrumb } from '../types';
 
@@ -24,6 +26,8 @@ interface FolderSelectorModalProps {
   currentFolderName: string;
   onSelectFolder: (folderId: string, folderName: string, breadcrumbs?: FolderBreadcrumb[]) => Promise<void>;
   accessToken: string | null;
+  matchingHOAFolders?: DriveFolder[];
+  noticeMessage?: string;
 }
 
 export const FolderSelectorModal: React.FC<FolderSelectorModalProps> = ({
@@ -33,6 +37,8 @@ export const FolderSelectorModal: React.FC<FolderSelectorModalProps> = ({
   currentFolderName,
   onSelectFolder,
   accessToken,
+  matchingHOAFolders = [],
+  noticeMessage,
 }) => {
   const [activeTab, setActiveTab] = useState<'browse' | 'link'>('browse');
   const [folders, setFolders] = useState<DriveFolder[]>([]);
@@ -43,26 +49,11 @@ export const FolderSelectorModal: React.FC<FolderSelectorModalProps> = ({
   ]);
   const [searchFilter, setSearchFilter] = useState('');
   
-  // Direct Link tab state
+  // Link tab state
   const [folderLinkInput, setFolderLinkInput] = useState('');
   const [isValidatingLink, setIsValidatingLink] = useState(false);
   const [linkValidationResult, setLinkValidationResult] = useState<{ id: string; name: string } | null>(null);
   const [linkError, setLinkError] = useState<string | null>(null);
-
-  // Sync initial state when modal opens
-  useEffect(() => {
-    if (isOpen) {
-      setBrowseFolderId(currentFolderId || 'root');
-      if (currentFolderId && currentFolderId !== 'root') {
-        setBrowseBreadcrumbs([
-          { id: 'root', name: 'My Drive' },
-          { id: currentFolderId, name: currentFolderName || 'Selected Folder' }
-        ]);
-      } else {
-        setBrowseBreadcrumbs([{ id: 'root', name: 'My Drive' }]);
-      }
-    }
-  }, [isOpen, currentFolderId, currentFolderName]);
 
   // Fetch folders in the current browsing parent
   useEffect(() => {
@@ -152,7 +143,7 @@ export const FolderSelectorModal: React.FC<FolderSelectorModalProps> = ({
     setBrowseFolderId(target.id);
   };
 
-  const handleConfirmFolder = async (folderId: string, folderName: string, customCrumbs?: FolderBreadcrumb[]) => {
+  const handleConfirmSelection = async (folderId: string, folderName: string, customCrumbs?: FolderBreadcrumb[]) => {
     const crumbs = customCrumbs || browseBreadcrumbs;
     await onSelectFolder(folderId, folderName, crumbs);
     onClose();
@@ -171,12 +162,12 @@ export const FolderSelectorModal: React.FC<FolderSelectorModalProps> = ({
         <div className="p-4 sm:p-5 border-b border-[#E2E8F0] flex items-center justify-between bg-[#F8FAFC]">
           <div className="flex items-center gap-2.5">
             <div className="w-9 h-9 rounded-xl bg-blue-50 text-[#2563EB] flex items-center justify-center border border-blue-100">
-              <FolderOpen className="w-5 h-5" />
+              <FolderTree className="w-5 h-5" />
             </div>
             <div>
-              <h2 className="text-base font-bold text-[#0F172A]">Select HOA Folder</h2>
+              <h2 className="text-base font-bold text-[#0F172A]">Select HOA Folder on Google Drive</h2>
               <p className="text-xs text-[#64748B]">
-                Automatically indexes all documents and subfolders in this location
+                Parses all files in all subfolders and removes indexes outside this folder
               </p>
             </div>
           </div>
@@ -199,7 +190,7 @@ export const FolderSelectorModal: React.FC<FolderSelectorModalProps> = ({
             }`}
           >
             <HardDrive className="w-3.5 h-3.5" />
-            <span>Browse Google Drive Folders</span>
+            <span>Browse Folders</span>
           </button>
           <button
             onClick={() => setActiveTab('link')}
@@ -214,37 +205,65 @@ export const FolderSelectorModal: React.FC<FolderSelectorModalProps> = ({
           </button>
         </div>
 
-        {/* Content */}
-        <div className="flex-1 overflow-y-auto p-5 space-y-4">
-          {activeTab === 'browse' ? (
-            <>
-              {/* Primary Confirmation Action Card */}
-              <div className="p-3.5 rounded-xl bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-200/80 shadow-2xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-1.5 text-[#2563EB]">
-                    <Layers className="w-3.5 h-3.5" />
-                    <span className="text-[10px] font-bold uppercase tracking-wider">
-                      Selected Folder Target
-                    </span>
-                  </div>
-                  <p className="text-sm font-bold text-[#0F172A] truncate mt-0.5" title={currentBrowsingName}>
-                    {currentBrowsingName}
-                  </p>
-                  <p className="text-[11px] text-[#64748B] mt-0.5">
-                    Will recursively index all bylaws, minutes, budgets, and nested subfolders.
-                  </p>
-                </div>
-
-                <button
-                  onClick={() => handleConfirmFolder(browseFolderId, currentBrowsingName)}
-                  className="px-4 py-2 rounded-xl bg-[#2563EB] hover:bg-[#1D4ED8] text-white text-xs font-bold transition shadow-xs flex items-center justify-center gap-2 flex-shrink-0 cursor-pointer"
-                >
-                  <FolderCheck className="w-4 h-4" />
-                  <span>Index "{currentBrowsingName}"</span>
-                </button>
+        {/* Notice banner if auto-discovery triggered modal */}
+        {noticeMessage && (
+          <div className="px-5 pt-3">
+            <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900 flex items-start gap-2.5">
+              <AlertCircle className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" />
+              <div className="flex-1">
+                <p className="font-semibold text-amber-950">HOA Folder Selection</p>
+                <p className="text-[11px] text-amber-800 mt-0.5">{noticeMessage}</p>
               </div>
+            </div>
+          </div>
+        )}
 
-              {/* Breadcrumbs */}
+        {/* Quick select list if multiple HOA folders were discovered */}
+        {matchingHOAFolders.length > 0 && (
+          <div className="px-5 pt-3">
+            <div className="p-3.5 rounded-xl bg-blue-50 border border-blue-200">
+              <p className="text-xs font-bold text-blue-950 flex items-center gap-1.5 mb-2">
+                <Sparkles className="w-3.5 h-3.5 text-[#2563EB]" />
+                Matching "HOA" Folders Found in Your Drive:
+              </p>
+              <div className="space-y-1.5 max-h-36 overflow-y-auto">
+                {matchingHOAFolders.map((hf) => (
+                  <button
+                    key={hf.id}
+                    onClick={() => handleConfirmSelection(hf.id, hf.name, [{ id: hf.id, name: hf.name }])}
+                    className="w-full flex items-center justify-between p-2 rounded-lg bg-white hover:bg-blue-100/60 border border-blue-200/80 transition text-left cursor-pointer group"
+                  >
+                    <div className="flex items-center gap-2 truncate">
+                      <Folder className="w-4 h-4 text-[#2563EB] flex-shrink-0" />
+                      <span className="text-xs font-semibold text-[#0F172A] group-hover:text-[#2563EB] truncate">
+                        {hf.name}
+                      </span>
+                    </div>
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-[#2563EB] px-2 py-0.5 bg-blue-50 rounded">
+                      Select This
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Info callout */}
+        <div className="px-5 pt-3 pb-0">
+          <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200 text-xs text-[#1E293B] flex items-center gap-2">
+            <Sparkles className="w-4 h-4 text-[#2563EB] flex-shrink-0" />
+            <span className="text-[11px] text-[#334155] leading-snug">
+              When a folder is selected, all documents in all its subfolders are parsed & indexed. Previous indexes outside this folder are pruned.
+            </span>
+          </div>
+        </div>
+
+        {/* Content */}
+        <div className="flex-1 overflow-y-auto p-5">
+          {activeTab === 'browse' ? (
+            <div className="space-y-4">
+              {/* Breadcrumb Bar */}
               <div className="flex items-center gap-1 p-2 rounded-xl bg-[#F1F5F9] border border-[#E2E8F0] overflow-x-auto text-xs">
                 {browseBreadcrumbs.map((crumb, idx) => {
                   const isLast = idx === browseBreadcrumbs.length - 1;
@@ -252,13 +271,13 @@ export const FolderSelectorModal: React.FC<FolderSelectorModalProps> = ({
                     <React.Fragment key={crumb.id + idx}>
                       <button
                         onClick={() => handleBreadcrumbClick(idx)}
-                        className={`px-2.5 py-1 rounded-md transition font-medium flex items-center gap-1.5 whitespace-nowrap cursor-pointer ${
+                        className={`px-2 py-1 rounded-md transition font-medium flex items-center gap-1 whitespace-nowrap cursor-pointer ${
                           isLast
-                            ? 'bg-white text-[#2563EB] shadow-2xs font-bold'
-                            : 'text-[#64748B] hover:text-[#0F172A] hover:bg-[#E2E8F0]/80'
+                            ? 'bg-white text-[#2563EB] shadow-2xs font-semibold'
+                            : 'text-[#64748B] hover:text-[#0F172A] hover:bg-[#E2E8F0]/70'
                         }`}
                       >
-                        {idx === 0 ? <HardDrive className="w-3.5 h-3.5" /> : <Folder className="w-3.5 h-3.5 text-amber-500" />}
+                        {idx === 0 ? <HardDrive className="w-3 h-3" /> : <Folder className="w-3 h-3" />}
                         <span>{crumb.name}</span>
                       </button>
                       {!isLast && <ChevronRight className="w-3 h-3 text-[#94A3B8] flex-shrink-0" />}
@@ -267,12 +286,31 @@ export const FolderSelectorModal: React.FC<FolderSelectorModalProps> = ({
                 })}
               </div>
 
+              {/* Current Active Target CTA banner */}
+              <div className="flex items-center justify-between p-3 rounded-xl bg-blue-50/90 border border-blue-200">
+                <div className="min-w-0 pr-3">
+                  <span className="text-[10px] font-bold text-[#2563EB] uppercase tracking-wider block">
+                    Select Target Folder & Subfolders
+                  </span>
+                  <p className="text-xs font-semibold text-[#0F172A] truncate">
+                    {currentBrowsingName}
+                  </p>
+                </div>
+                <button
+                  onClick={() => handleConfirmSelection(browseFolderId, currentBrowsingName)}
+                  className="px-3 py-1.5 rounded-lg bg-[#2563EB] hover:bg-[#1D4ED8] text-white text-xs font-semibold transition shadow-xs flex items-center gap-1.5 flex-shrink-0 cursor-pointer"
+                >
+                  <FolderCheck className="w-3.5 h-3.5" />
+                  <span>Parse "{currentBrowsingName}"</span>
+                </button>
+              </div>
+
               {/* Search filter for subfolders */}
               <div className="relative">
                 <Search className="w-3.5 h-3.5 text-[#94A3B8] absolute left-3 top-1/2 -translate-y-1/2" />
                 <input
                   type="text"
-                  placeholder={`Search subfolders in ${currentBrowsingName}...`}
+                  placeholder="Filter subfolders..."
                   value={searchFilter}
                   onChange={(e) => setSearchFilter(e.target.value)}
                   className="w-full pl-8 pr-3 py-2 text-xs bg-white border border-[#CBD5E1] rounded-lg focus:outline-none focus:ring-1 focus:ring-[#2563EB] focus:border-[#2563EB]"
@@ -281,14 +319,9 @@ export const FolderSelectorModal: React.FC<FolderSelectorModalProps> = ({
 
               {/* Subfolder list */}
               <div className="space-y-1.5 max-h-56 overflow-y-auto">
-                <div className="flex items-center justify-between px-1">
-                  <p className="text-[11px] font-bold text-[#64748B] uppercase tracking-wider">
-                    Folders inside {currentBrowsingName}
-                  </p>
-                  <span className="text-[10px] text-[#94A3B8]">
-                    Click folder name to navigate into it
-                  </span>
-                </div>
+                <p className="text-[11px] font-semibold text-[#64748B] px-1 uppercase tracking-wider">
+                  Subfolders inside {currentBrowsingName}
+                </p>
 
                 {isLoadingFolders ? (
                   <div className="py-8 flex flex-col items-center justify-center gap-2 text-[#64748B]">
@@ -297,7 +330,7 @@ export const FolderSelectorModal: React.FC<FolderSelectorModalProps> = ({
                   </div>
                 ) : filteredFolders.length === 0 ? (
                   <div className="py-6 text-center text-xs text-[#94A3B8] bg-[#F8FAFC] rounded-xl border border-dashed border-[#E2E8F0]">
-                    {searchFilter ? 'No matching folders found.' : 'No subfolders here. Click the blue button above to index this folder.'}
+                    {searchFilter ? 'No matching folders found.' : 'No subfolders in this location.'}
                   </div>
                 ) : (
                   filteredFolders.map((folder) => {
@@ -306,7 +339,6 @@ export const FolderSelectorModal: React.FC<FolderSelectorModalProps> = ({
                         key={folder.id}
                         className="group flex items-center justify-between p-2.5 rounded-xl border border-[#E2E8F0] hover:border-blue-300 hover:bg-blue-50/40 transition"
                       >
-                        {/* Click to open subfolder */}
                         <button
                           onClick={() => handleDrillDown(folder)}
                           className="flex items-center gap-2.5 text-left flex-1 min-w-0 cursor-pointer"
@@ -315,37 +347,45 @@ export const FolderSelectorModal: React.FC<FolderSelectorModalProps> = ({
                             <Folder className="w-4 h-4" />
                           </div>
                           <div className="truncate">
-                            <p className="text-xs font-semibold text-[#1E293B] group-hover:text-[#2563EB] truncate">
+                            <p className="text-xs font-medium text-[#1E293B] group-hover:text-[#2563EB] truncate">
                               {folder.name}
                             </p>
                             <span className="text-[10px] text-[#94A3B8]">Click to open subfolder</span>
                           </div>
                         </button>
 
-                        {/* Direct Select button */}
-                        <button
-                          onClick={() => handleConfirmFolder(folder.id, folder.name, [...browseBreadcrumbs, { id: folder.id, name: folder.name }])}
-                          className="px-2.5 py-1.5 rounded-lg bg-white border border-[#CBD5E1] hover:bg-[#2563EB] hover:text-white hover:border-[#2563EB] text-xs font-semibold text-[#334155] transition shadow-2xs cursor-pointer flex items-center gap-1.5"
-                          title={`Directly index ${folder.name} and all its subfolders`}
-                        >
-                          <FolderCheck className="w-3.5 h-3.5 text-[#2563EB] group-hover:text-white" />
-                          <span>Index This</span>
-                        </button>
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            onClick={() => handleConfirmSelection(folder.id, folder.name, [...browseBreadcrumbs, { id: folder.id, name: folder.name }])}
+                            className="px-2.5 py-1 rounded-md bg-white border border-[#CBD5E1] hover:bg-[#2563EB] hover:text-white hover:border-[#2563EB] text-[11px] font-medium text-[#475569] transition shadow-2xs cursor-pointer flex items-center gap-1"
+                            title={`Select ${folder.name} and all its subfolders`}
+                          >
+                            <FolderCheck className="w-3 h-3" />
+                            <span>Select</span>
+                          </button>
+                          <button
+                            onClick={() => handleDrillDown(folder)}
+                            className="p-1 rounded-md hover:bg-[#E2E8F0] text-[#64748B] transition cursor-pointer"
+                            title="Open folder"
+                          >
+                            <ChevronRight className="w-4 h-4" />
+                          </button>
+                        </div>
                       </div>
                     );
                   })
                 )}
               </div>
-            </>
+            </div>
           ) : (
             <div className="space-y-4">
               <div className="p-3 rounded-xl bg-blue-50/50 border border-blue-200 text-xs text-[#1E293B] space-y-1">
-                <p className="font-bold text-[#0F172A] flex items-center gap-1.5">
+                <p className="font-semibold text-[#0F172A] flex items-center gap-1.5">
                   <Link2 className="w-3.5 h-3.5 text-[#2563EB]" />
-                  Paste Google Drive Folder Link
+                  Direct Link or Folder ID
                 </p>
                 <p className="text-[11px] text-[#64748B]">
-                  Open Google Drive in your browser, copy the URL of your HOA folder (e.g. <code>https://drive.google.com/drive/folders/1ABC...</code>) and paste it below. All documents and subfolders will be indexed automatically.
+                  Open Google Drive, copy the URL of your HOA folder (e.g. <code>https://drive.google.com/drive/folders/1ABC...</code>) and paste it below.
                 </p>
               </div>
 
@@ -401,7 +441,7 @@ export const FolderSelectorModal: React.FC<FolderSelectorModalProps> = ({
                     </div>
                     <div>
                       <span className="text-[10px] font-bold text-emerald-800 uppercase tracking-wider block">
-                        Folder Verified Successfully
+                        Folder Verified
                       </span>
                       <p className="text-xs font-bold text-emerald-950">
                         {linkValidationResult.name}
@@ -411,14 +451,14 @@ export const FolderSelectorModal: React.FC<FolderSelectorModalProps> = ({
                   </div>
 
                   <button
-                    onClick={() => handleConfirmFolder(linkValidationResult.id, linkValidationResult.name, [
+                    onClick={() => handleConfirmSelection(linkValidationResult.id, linkValidationResult.name, [
                       { id: 'root', name: 'My Drive' },
                       { id: linkValidationResult.id, name: linkValidationResult.name }
                     ])}
-                    className="w-full py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold transition shadow-xs flex items-center justify-center gap-2 cursor-pointer"
+                    className="w-full py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold transition shadow-xs flex items-center justify-center gap-1.5 cursor-pointer"
                   >
-                    <Check className="w-4 h-4" />
-                    <span>Index "{linkValidationResult.name}" & Subfolders</span>
+                    <Check className="w-3.5 h-3.5" />
+                    <span>Parse and Index "{linkValidationResult.name}" & Subfolders</span>
                   </button>
                 </div>
               )}
@@ -429,15 +469,15 @@ export const FolderSelectorModal: React.FC<FolderSelectorModalProps> = ({
         {/* Footer */}
         <div className="p-3.5 sm:p-4 border-t border-[#E2E8F0] bg-[#F8FAFC] flex items-center justify-between text-xs">
           <button
-            onClick={() => handleConfirmFolder('root', 'My Drive', [{ id: 'root', name: 'My Drive' }])}
+            onClick={() => handleConfirmSelection('root', 'My Drive', [{ id: 'root', name: 'My Drive' }])}
             className="text-[#64748B] hover:text-[#2563EB] font-medium transition underline cursor-pointer"
           >
-            Reset to My Drive (Root)
+            Reset to My Drive Root
           </button>
 
           <button
             onClick={onClose}
-            className="px-4 py-1.5 rounded-lg border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#334155] font-semibold transition cursor-pointer"
+            className="px-3.5 py-1.5 rounded-lg border border-[#CBD5E1] bg-white hover:bg-[#F1F5F9] text-[#334155] font-semibold transition cursor-pointer"
           >
             Cancel
           </button>

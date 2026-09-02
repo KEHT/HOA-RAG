@@ -7,20 +7,23 @@ export interface DriveFile {
   iconLink?: string;
   webViewLink?: string;
   parents?: string[];
-  folderId?: string;
-  folderName?: string;
-  folderPath?: string;
   category?: 'bylaws' | 'minutes' | 'financials' | 'architectural' | 'rules' | 'general';
   isHOAKeywordMatch?: boolean;
   pageCount?: number;
   extractedLength?: number;
   snippet?: string;
   isImageDoc?: boolean;
+  isOfficeDoc?: boolean;
   imageUrl?: string;
   content?: string;
   summary?: string;
   keyHighlights?: string[];
   importantDatesOrAmounts?: string[];
+  folderId?: string;
+  folderName?: string;
+  folderPath?: string;
+  subfolderBreadcrumbs?: string[];
+  isIndexed?: boolean;
 }
 
 export interface DriveFolder {
@@ -31,7 +34,6 @@ export interface DriveFolder {
   webViewLink?: string;
   modifiedTime?: string;
   fileCount?: number;
-  subfolderCount?: number;
 }
 
 export interface FolderBreadcrumb {
@@ -46,6 +48,7 @@ export interface SourceCitation {
   sectionOrClause?: string;
   pageNumber?: number;
   snippet: string;
+  folderPath?: string;
   matchScore?: number;
 }
 
@@ -67,4 +70,13 @@ export interface HOAOverview {
   financialCount: number;
   rulesCount: number;
   totalDocuments: number;
+}
+
+export interface AIConfig {
+  provider: 'gemini' | 'custom';
+  geminiModel: string;
+  customEndpoint: string;
+  customModelName: string;
+  customApiKey?: string;
+  temperature: number;
 }

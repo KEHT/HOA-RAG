@@ -11,33 +11,69 @@ import { ChatInterface } from './components/ChatInterface';
 import { SourceSnippetModal } from './components/SourceSnippetModal';
 import { DocSummaryModal } from './components/DocSummaryModal';
 import { FolderSelectorModal } from './components/FolderSelectorModal';
-import { DriveFile, DriveFolder, FolderBreadcrumb, ChatMessage, SourceCitation } from './types';
+import { AISettingsModal } from './components/AISettingsModal';
+import { DriveFile, DriveFolder, FolderBreadcrumb, ChatMessage, SourceCitation, AIConfig } from './types';
 import { initAuth, googleSignIn, logout, getAccessToken } from './lib/firebase';
-import { Menu, X } from 'lucide-react';
+import { saveLocalData, getLocalData, clearLocalData } from './lib/indexedDb';
+import { Menu, X, Loader2 } from 'lucide-react';
+
+const DEFAULT_AI_CONFIG: AIConfig = {
+  provider: 'gemini',
+  geminiModel: 'gemini-3.7-flash',
+  customEndpoint: 'http://localhost:11434/v1',
+  customModelName: 'llama3.3',
+  customApiKey: '',
+  temperature: 0.2,
+};
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [hasDriveAccess, setHasDriveAccess] = useState(false);
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   
+  // AI Config state with localStorage persistence
+  const [aiConfig, setAIConfig] = useState<AIConfig>(() => {
+    try {
+      const saved = localStorage.getItem('hoa_ai_config');
+      if (saved) {
+        return { ...DEFAULT_AI_CONFIG, ...JSON.parse(saved) };
+      }
+    } catch {
+      // Fallback
+    }
+    return DEFAULT_AI_CONFIG;
+  });
+  const [isAISettingsOpen, setIsAISettingsOpen] = useState(false);
+
+  const handleSaveAIConfig = (newConfig: AIConfig) => {
+    setAIConfig(newConfig);
+    try {
+      localStorage.setItem('hoa_ai_config', JSON.stringify(newConfig));
+    } catch {
+      // Ignore
+    }
+  };
+
   // Document state
-  const [isSampleMode, setIsSampleMode] = useState(false);
   const [driveFiles, setDriveFiles] = useState<DriveFile[]>([]);
-  const [sampleFiles, setSampleFiles] = useState<DriveFile[]>([]);
   const [customDocs, setCustomDocs] = useState<DriveFile[]>([]);
   const [selectedDocIds, setSelectedDocIds] = useState<string[]>([]);
   const [isLoadingDocs, setIsLoadingDocs] = useState(false);
+  const [isIndexingFolder, setIsIndexingFolder] = useState(false);
+  const [indexingStatusText, setIndexingStatusText] = useState<string>('');
   const [isRefreshingDrive, setIsRefreshingDrive] = useState(false);
-  const [isUploadingImage, setIsUploadingImage] = useState(false);
+  const [isUploadingFile, setIsUploadingFile] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
 
-  // Folder scoping state
+  // Folder scoping & discovery state
   const [currentFolderId, setCurrentFolderId] = useState<string>('root');
   const [currentFolderName, setCurrentFolderName] = useState<string>('My Drive');
   const [folderBreadcrumbs, setFolderBreadcrumbs] = useState<FolderBreadcrumb[]>([
     { id: 'root', name: 'My Drive' }
   ]);
   const [availableSubfolders, setAvailableSubfolders] = useState<DriveFolder[]>([]);
+  const [matchingHOAFolders, setMatchingHOAFolders] = useState<DriveFolder[]>([]);
+  const [folderModalNotice, setFolderModalNotice] = useState<string>('');
   const [isFolderModalOpen, setIsFolderModalOpen] = useState(false);
 
   // Chat state
@@ -51,95 +87,300 @@ export default function App() {
   const [docSummaryData, setDocSummaryData] = useState<any>(null);
   const [isLoadingSummary, setIsLoadingSummary] = useState(false);
 
-  // Fetch sample documents from backend
-  const loadSampleDocs = useCallback(async () => {
-    try {
-      const res = await fetch('/api/documents/sample');
-      if (res.ok) {
-        const data = await res.json();
-        const formatted: DriveFile[] = (data.documents || []).map((d: any) => ({
-          id: d.id,
-          name: d.name,
-          category: d.category,
-          mimeType: d.mimeType,
-          modifiedTime: d.modifiedTime,
-          snippet: d.summary,
-          isHOAKeywordMatch: true,
-        }));
-        setSampleFiles(formatted);
-        // If in sample mode or initially no drive files, select sample docs by default
-        setSelectedDocIds(prev => prev.length === 0 ? formatted.map(f => f.id) : prev);
-      }
-    } catch (err) {
-      console.error('Error loading sample HOA documents:', err);
-    }
-  }, []);
+  // Restore client persistent state from IndexedDB on initial mount
+  useEffect(() => {
+    async function restorePersistedState() {
+      try {
+        const [savedDriveFiles, savedCustomDocs, savedFolderMeta, savedMessages] = await Promise.all([
+          getLocalData<DriveFile[]>('saved_drive_files'),
+          getLocalData<DriveFile[]>('saved_custom_docs'),
+          getLocalData<{ folderId: string; folderName: string; breadcrumbs: FolderBreadcrumb[] }>('saved_folder_meta'),
+          getLocalData<ChatMessage[]>('saved_chat_messages'),
+        ]);
 
-  // Fetch Google Drive files strictly from a specific folder and recursively index all its contents
-  const loadDriveFiles = useCallback(async (token: string, targetFolderId?: string, targetFolderName?: string) => {
-    const folderToQuery = targetFolderId !== undefined ? targetFolderId : currentFolderId;
-    setIsLoadingDocs(true);
-    setDriveFiles([]); // Clear previous files immediately so old folder files do not linger
-    try {
-      // 1. Fetch files inside the targeted folder & recursively index all subfolders
-      const res = await fetch(`/api/drive/files?folderId=${folderToQuery}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (res.ok) {
-        const data = await res.json();
-        const files: DriveFile[] = data.files || [];
-        setDriveFiles(files);
-        setAvailableSubfolders(data.subfolders || []);
-
-        if (data.rootFolder && data.rootFolder.name && targetFolderName === undefined) {
-          setCurrentFolderName(data.rootFolder.name);
+        if (savedDriveFiles && savedDriveFiles.length > 0) {
+          setDriveFiles(savedDriveFiles);
+        }
+        if (savedCustomDocs && savedCustomDocs.length > 0) {
+          setCustomDocs(savedCustomDocs);
+        }
+        if (savedFolderMeta) {
+          setCurrentFolderId(savedFolderMeta.folderId || 'root');
+          setCurrentFolderName(savedFolderMeta.folderName || 'My Drive');
+          if (savedFolderMeta.breadcrumbs) {
+            setFolderBreadcrumbs(savedFolderMeta.breadcrumbs);
+          }
+        }
+        if (savedMessages && savedMessages.length > 0) {
+          setMessages(savedMessages);
         }
 
-        // Automatically select all discovered files in this folder tree
-        const allDiscoveredIds = files.map(f => f.id);
-        setSelectedDocIds(allDiscoveredIds);
-        return { files, subfolders: data.subfolders || [], totalFiles: data.totalIndexedFiles ?? files.length, totalSubfolders: data.totalIndexedSubfolders ?? 0 };
-      } else {
-        console.warn('Could not fetch Drive files:', res.statusText);
+        // Auto-select all restored documents
+        const allIds = [
+          ...(savedDriveFiles || []).map(f => f.id),
+          ...(savedCustomDocs || []).map(c => c.id)
+        ];
+        if (allIds.length > 0) {
+          setSelectedDocIds(allIds);
+        }
+      } catch (err) {
+        console.warn('Could not restore cached state from IndexedDB:', err);
       }
-    } catch (err) {
-      console.error('Error in loadDriveFiles:', err);
+    }
+    restorePersistedState();
+  }, []);
+
+  // Save changes to IndexedDB when documents, folders, or messages change
+  useEffect(() => {
+    if (driveFiles.length > 0) {
+      saveLocalData('saved_drive_files', driveFiles);
+    }
+  }, [driveFiles]);
+
+  useEffect(() => {
+    if (customDocs.length > 0) {
+      saveLocalData('saved_custom_docs', customDocs);
+    }
+  }, [customDocs]);
+
+  useEffect(() => {
+    if (messages.length > 0) {
+      saveLocalData('saved_chat_messages', messages);
+    }
+  }, [messages]);
+
+  useEffect(() => {
+    saveLocalData('saved_folder_meta', {
+      folderId: currentFolderId,
+      folderName: currentFolderName,
+      breadcrumbs: folderBreadcrumbs,
+    });
+  }, [currentFolderId, currentFolderName, folderBreadcrumbs]);
+
+  /**
+   * Parse all files in the selected folder and all its subfolders with incremental sync.
+   * Reuses unchanged cached docs and prunes non-folder files.
+   */
+  const indexAndParseDriveFolder = useCallback(async (
+    token: string, 
+    targetFolderId: string, 
+    targetFolderName: string,
+    forceFullReindex: boolean = false
+  ) => {
+    setIsIndexingFolder(true);
+    setIsLoadingDocs(true);
+    setIndexingStatusText(`Scanning "${targetFolderName}" and traversing all subfolders...`);
+
+    try {
+      // Call backend to recursively scan, parse all new/modified files in subfolders, and prune out-of-scope indexes
+      const res = await fetch('/api/drive/index-folder', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          folderId: targetFolderId,
+          folderName: targetFolderName,
+          forceFullReindex,
+          aiConfig,
+        }),
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || 'Failed to index folder and subfolders');
+      }
+
+      const data = await res.json();
+      const parsedFiles: DriveFile[] = (data.files || []).map((f: any) => ({
+        id: f.id,
+        name: f.name,
+        category: f.category,
+        mimeType: f.mimeType,
+        size: f.size,
+        modifiedTime: f.modifiedTime,
+        iconLink: f.iconLink,
+        webViewLink: f.webViewLink,
+        snippet: f.snippet || (f.content ? f.content.slice(0, 240) + '...' : ''),
+        content: f.content,
+        summary: f.summary,
+        folderId: f.folderId,
+        folderName: f.folderName,
+        folderPath: f.folderPath,
+        isHOAKeywordMatch: f.isHOAKeywordMatch,
+        isImageDoc: f.isImageDoc,
+        isOfficeDoc: f.isOfficeDoc,
+        isIndexed: true,
+      }));
+
+      // Update in-memory and persistent drive files
+      setDriveFiles(parsedFiles);
+      saveLocalData('saved_drive_files', parsedFiles);
+
+      // Subfolders discovered
+      const subfolders: DriveFolder[] = (data.subfolders || [])
+        .filter((sf: any) => sf.id !== targetFolderId)
+        .map((sf: any) => ({
+          id: sf.id,
+          name: sf.name,
+          path: sf.path,
+          parentId: sf.parentId,
+          modifiedTime: sf.modifiedTime,
+        }));
+      setAvailableSubfolders(subfolders);
+
+      // Auto-select all indexed files from this folder and its subfolders
+      const allIndexedIds = [...parsedFiles.map(f => f.id), ...customDocs.map(c => c.id)];
+      setSelectedDocIds(allIndexedIds);
+
+      // Add informative assistant message to chat detailing incremental sync stats
+      const subfolderSummary = data.totalSubfolders > 0
+        ? ` across **${data.totalSubfolders} subfolder${data.totalSubfolders === 1 ? '' : 's'}**`
+        : '';
+      
+      const cachedCount = data.cachedCount ?? 0;
+      const newOrUpdatedCount = data.newOrUpdatedCount ?? parsedFiles.length;
+      const removedCount = data.removedCount ?? 0;
+
+      let syncDetailText = '';
+      if (cachedCount > 0 && newOrUpdatedCount > 0) {
+        syncDetailText = `\n\n⚡ *Incremental Sync:* ${cachedCount} unchanged files kept from persistent cache, ${newOrUpdatedCount} new/updated files parsed.`;
+      } else if (cachedCount > 0 && newOrUpdatedCount === 0) {
+        syncDetailText = `\n\n⚡ *Instant Cache:* All ${cachedCount} files loaded from persistent storage (no modifications detected).`;
+      } else if (newOrUpdatedCount > 0) {
+        syncDetailText = `\n\n⚡ *Initial Indexing:* Parsed ${newOrUpdatedCount} files into persistent memory.`;
+      }
+
+      if (removedCount > 0) {
+        syncDetailText += ` (${removedCount} deleted file${removedCount === 1 ? '' : 's'} pruned).`;
+      }
+
+      const indexNoticeMsg: ChatMessage = {
+        id: `msg-${Date.now()}-index-success`,
+        role: 'model',
+        content: `📁 **Folder & Subfolders Indexed:** Scoped exclusively to **"${targetFolderName}"**.\n\nIndexed **${parsedFiles.length} file${parsedFiles.length === 1 ? '' : 's'}**${subfolderSummary}.${syncDetailText}\n\n*Previous document indexes outside "${targetFolderName}" have been pruned.*`,
+        timestamp: Date.now(),
+        suggestedQuestions: parsedFiles.length > 0 ? [
+          `Summarize the key governing rules in "${targetFolderName}"`,
+          `What are the most recent meeting minutes or resolutions?`,
+          `What are the financial assessments or budget figures in this folder?`
+        ] : [
+          `How do I add documents or select a different folder?`,
+          `What file types are supported for indexing?`
+        ]
+      };
+
+      setMessages(prev => [...prev, indexNoticeMsg]);
+    } catch (err: any) {
+      console.error('Error in indexAndParseDriveFolder:', err);
+      const errorMsg: ChatMessage = {
+        id: `msg-${Date.now()}-index-err`,
+        role: 'model',
+        content: `❌ **Failed to index folder:** ${err.message || 'Unknown error'}. Please check your Google Drive permissions and try again.`,
+        timestamp: Date.now(),
+        error: true,
+      };
+      setMessages(prev => [...prev, errorMsg]);
     } finally {
+      setIsIndexingFolder(false);
       setIsLoadingDocs(false);
       setIsRefreshingDrive(false);
+      setIndexingStatusText('');
     }
-    return null;
-  }, [currentFolderId]);
+  }, [customDocs, aiConfig]);
+
+  /**
+   * Automatic "HOA" folder discovery workflow upon connecting to Google Drive
+   */
+  const handleDriveConnectedWorkflow = useCallback(async (token: string) => {
+    setIsLoadingDocs(true);
+    setIndexingStatusText('Checking Google Drive for "HOA" folder...');
+
+    try {
+      const res = await fetch('/api/drive/search-hoa-folders', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      if (!res.ok) {
+        throw new Error('Could not search Google Drive folders');
+      }
+
+      const data = await res.json();
+      const discoveredFolders: Array<{ id: string; name: string; modifiedTime?: string }> = data.folders || [];
+
+      if (discoveredFolders.length === 1) {
+        // EXACTLY 1 HOA FOLDER FOUND: Auto-select and index it
+        const hoaFolder = discoveredFolders[0];
+        setCurrentFolderId(hoaFolder.id);
+        setCurrentFolderName(hoaFolder.name);
+        setFolderBreadcrumbs([{ id: hoaFolder.id, name: hoaFolder.name }]);
+        setMatchingHOAFolders([]);
+        setFolderModalNotice('');
+        
+        await indexAndParseDriveFolder(token, hoaFolder.id, hoaFolder.name);
+      } else if (discoveredFolders.length === 0) {
+        // 0 HOA FOLDERS FOUND: Prompt user to select a folder before indexing
+        setMatchingHOAFolders([]);
+        setFolderModalNotice('No folder named "HOA" was found in your Google Drive. Please select or paste the link to your HOA document folder to begin indexing.');
+        setIsFolderModalOpen(true);
+
+        const promptMsg: ChatMessage = {
+          id: `msg-${Date.now()}-no-hoa-folder`,
+          role: 'model',
+          content: `⚠️ **No "HOA" Folder Found:** We could not automatically locate a folder named **"HOA"** in your Google Drive.\n\nPlease select or paste the link to your community folder using the folder selector to begin indexing.`,
+          timestamp: Date.now(),
+          suggestedQuestions: [
+            `How do I select or link a Google Drive folder?`,
+            `Can I upload files directly instead?`
+          ]
+        };
+        setMessages(prev => [...prev, promptMsg]);
+      } else {
+        // MULTIPLE HOA FOLDERS FOUND: Prompt user to choose which one
+        const formattedFolders: DriveFolder[] = discoveredFolders.map(f => ({
+          id: f.id,
+          name: f.name,
+          modifiedTime: f.modifiedTime,
+        }));
+        setMatchingHOAFolders(formattedFolders);
+        setFolderModalNotice(`Found ${discoveredFolders.length} folders named "HOA" in your Google Drive. Please choose which one to index.`);
+        setIsFolderModalOpen(true);
+
+        const multipleMsg: ChatMessage = {
+          id: `msg-${Date.now()}-multiple-hoa`,
+          role: 'model',
+          content: `📁 **Multiple "HOA" Folders Found:** We found **${discoveredFolders.length} folders** named "HOA" in your Google Drive.\n\nPlease select the correct folder from the prompt to begin indexing.`,
+          timestamp: Date.now(),
+        };
+        setMessages(prev => [...prev, multipleMsg]);
+      }
+    } catch (err: any) {
+      console.warn('Error during HOA folder discovery:', err);
+      // Fallback: Open folder selector modal
+      setFolderModalNotice('Please select your HOA documents folder to begin indexing.');
+      setIsFolderModalOpen(true);
+    } finally {
+      setIsLoadingDocs(false);
+      setIndexingStatusText('');
+    }
+  }, [indexAndParseDriveFolder]);
 
   // Handle selecting a specific folder
   const handleSelectFolder = async (folderId: string, folderName: string, customBreadcrumbs?: FolderBreadcrumb[]) => {
     setCurrentFolderId(folderId);
     setCurrentFolderName(folderName);
-    if (customBreadcrumbs) {
-      setFolderBreadcrumbs(customBreadcrumbs);
-    }
+    const crumbs = customBreadcrumbs || [{ id: folderId, name: folderName }];
+    setFolderBreadcrumbs(crumbs);
+    
+    // Clear discovered HOA modal state
+    setMatchingHOAFolders([]);
+    setFolderModalNotice('');
+
     const token = getAccessToken();
-    let indexedStats: any = null;
     if (token) {
-      indexedStats = await loadDriveFiles(token, folderId, folderName);
+      await indexAndParseDriveFolder(token, folderId, folderName);
     }
-
-    const fileCount = indexedStats ? indexedStats.totalFiles : 0;
-    const subfolderCount = indexedStats ? indexedStats.totalSubfolders : 0;
-
-    // Add informative assistant message confirming recursive indexing
-    const folderMsg: ChatMessage = {
-      id: `msg-${Date.now()}-folder-scope`,
-      role: 'model',
-      content: `📁 **Folder Scoped & Indexed:** Successfully indexed **${fileCount} document${fileCount === 1 ? '' : 's'}** across **${subfolderCount} subfolder${subfolderCount === 1 ? '' : 's'}** in **"${folderName}"**.\n\nAll documents in this folder are automatically selected and ready for questions. No files from outside this folder will be queried.`,
-      timestamp: Date.now(),
-      suggestedQuestions: [
-        `What documents are in ${folderName}?`,
-        `Summarize the key bylaws or rules in this folder`,
-        `What are the financial figures in this folder?`
-      ]
-    };
-    setMessages(prev => [...prev, folderMsg]);
   };
 
   // Handle navigating via breadcrumb
@@ -149,37 +390,23 @@ export default function App() {
     await handleSelectFolder(target.id, target.name, newCrumbs);
   };
 
-  // Handle drilling down into a subfolder
-  const handleDrillIntoFolder = async (folder: DriveFolder) => {
-    const newCrumbs = [...folderBreadcrumbs, { id: folder.id, name: folder.name }];
-    await handleSelectFolder(folder.id, folder.name, newCrumbs);
-  };
-
-  // Handle reset to My Drive root
-  const handleResetToRoot = async () => {
-    await handleSelectFolder('root', 'My Drive', [{ id: 'root', name: 'My Drive' }]);
-  };
-
   // Initialize auth listener
   useEffect(() => {
-    loadSampleDocs();
-
     const unsubscribe = initAuth(
       (currentUser, token) => {
         setUser(currentUser);
         setHasDriveAccess(true);
-        loadDriveFiles(token, 'root', 'My Drive');
+        // Trigger HOA folder discovery workflow
+        handleDriveConnectedWorkflow(token);
       },
       () => {
         setUser(null);
         setHasDriveAccess(false);
-        // Default to sample mode if not logged in
-        setIsSampleMode(true);
       }
     );
 
     return () => unsubscribe();
-  }, [loadSampleDocs, loadDriveFiles]);
+  }, [handleDriveConnectedWorkflow]);
 
   // Handle Google Sign in
   const handleLogin = async () => {
@@ -189,8 +416,7 @@ export default function App() {
       if (result) {
         setUser(result.user);
         setHasDriveAccess(true);
-        setIsSampleMode(false);
-        await loadDriveFiles(result.accessToken, 'root', 'My Drive');
+        await handleDriveConnectedWorkflow(result.accessToken);
       }
     } catch (err: any) {
       console.error('Sign-in error:', err);
@@ -202,30 +428,33 @@ export default function App() {
   // Handle Sign out
   const handleLogout = async () => {
     await logout();
+    await clearLocalData();
     setUser(null);
     setHasDriveAccess(false);
     setDriveFiles([]);
-    setIsSampleMode(true);
+    setCustomDocs([]);
     setCurrentFolderId('root');
     setCurrentFolderName('My Drive');
     setFolderBreadcrumbs([{ id: 'root', name: 'My Drive' }]);
-    setSelectedDocIds(sampleFiles.map(f => f.id));
+    setSelectedDocIds([]);
+    setMatchingHOAFolders([]);
+    setFolderModalNotice('');
+
+    // Clear backend index
+    fetch('/api/drive/clear-index', { method: 'POST' }).catch(() => {});
   };
 
-  // Refresh Google Drive
+  // Refresh / Re-index Google Drive folder (incremental)
   const handleRefreshDrive = async () => {
     const token = getAccessToken();
     if (token) {
       setIsRefreshingDrive(true);
-      await loadDriveFiles(token, currentFolderId, currentFolderName);
+      await indexAndParseDriveFolder(token, currentFolderId, currentFolderName);
     }
   };
 
-  // Active files list strictly determined by current mode
-  // In Google Drive mode, show strictly and only the files returned from the selected Drive folder tree
-  const activeFilesList = isSampleMode 
-    ? [...customDocs, ...sampleFiles]
-    : [...customDocs.filter(c => c.isImageDoc), ...driveFiles];
+  // Active files list (custom uploaded files + drive files)
+  const activeFilesList = [...customDocs, ...driveFiles];
 
   const handleToggleSelectDoc = (id: string) => {
     setSelectedDocIds(prev => 
@@ -241,25 +470,14 @@ export default function App() {
     setSelectedDocIds([]);
   };
 
-  const handleSwitchMode = (toSample: boolean) => {
-    setIsSampleMode(toSample);
-    if (toSample) {
-      setSelectedDocIds([...customDocs.map(c => c.id), ...sampleFiles.map(f => f.id)]);
-    } else {
-      setSelectedDocIds(driveFiles.map(f => f.id));
-    }
-  };
-
-  // Upload and OCR Parse JPG / Image of Meeting or Financials
-  const handleUploadImage = async (file: File) => {
-    setIsUploadingImage(true);
+  // Upload and Parse MS Office (.docx, .xlsx, .pptx), PDF, or JPG/PNG files
+  const handleUploadFile = async (file: File) => {
+    setIsUploadingFile(true);
     try {
-      // Convert file to base64
       const base64Data = await new Promise<string>((resolve, reject) => {
         const reader = new FileReader();
         reader.onload = () => {
           const result = reader.result as string;
-          // Extract pure base64 without prefix
           const base64 = result.includes(',') ? result.split(',')[1] : result;
           resolve(base64);
         };
@@ -267,75 +485,78 @@ export default function App() {
         reader.readAsDataURL(file);
       });
 
-      const res = await fetch('/api/documents/parse-image', {
+      const res = await fetch('/api/documents/parse-file', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          imageBufferBase64: base64Data,
-          mimeType: file.type || 'image/jpeg',
+          fileBase64: base64Data,
+          mimeType: file.type || 'application/octet-stream',
           fileName: file.name,
+          aiConfig,
         }),
       });
 
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.error || 'Failed to parse image with Gemini Vision');
+        throw new Error(errData.error || 'Failed to parse uploaded document');
       }
 
-      const data = await res.json();
-      const parsed = data.parsed;
+      const parsed = await res.json();
 
       const newDoc: DriveFile = {
-        id: `img-doc-${Date.now()}`,
-        name: parsed.fileName || file.name,
+        id: parsed.id || `upload-doc-${Date.now()}`,
+        name: parsed.name || file.name,
         category: parsed.category || 'general',
-        mimeType: file.type || 'image/jpeg',
+        mimeType: file.type || 'application/octet-stream',
         modifiedTime: new Date().toISOString(),
-        snippet: parsed.summary,
+        snippet: parsed.summary || parsed.snippet,
         isHOAKeywordMatch: true,
-        isImageDoc: true,
+        isImageDoc: parsed.isImageDoc,
+        isOfficeDoc: parsed.isOfficeDoc,
         content: parsed.content,
         summary: parsed.summary,
         keyHighlights: parsed.keyHighlights,
         importantDatesOrAmounts: parsed.importantDatesOrAmounts,
+        folderPath: `Uploaded Files`,
       };
 
-      setCustomDocs(prev => [newDoc, ...prev]);
+      const updatedCustom = [newDoc, ...customDocs];
+      setCustomDocs(updatedCustom);
+      saveLocalData('saved_custom_docs', updatedCustom);
       setSelectedDocIds(prev => [newDoc.id, ...prev]);
 
-      // Add a helpful assistant notification to the chat
       const highlightsText = parsed.keyHighlights && parsed.keyHighlights.length > 0
         ? `\n\n**Key Highlights:**\n${parsed.keyHighlights.map((h: string) => `• ${h}`).join('\n')}`
         : '';
       const amountsText = parsed.importantDatesOrAmounts && parsed.importantDatesOrAmounts.length > 0
-        ? `\n\n**Key Dates & Figures Extracted:**\n${parsed.importantDatesOrAmounts.map((a: string) => `• ${a}`).join('\n')}`
+        ? `\n\n**Key Figures Extracted:**\n${parsed.importantDatesOrAmounts.map((a: string) => `• ${a}`).join('\n')}`
         : '';
 
       const notificationMsg: ChatMessage = {
-        id: `msg-${Date.now()}-img-success`,
+        id: `msg-${Date.now()}-file-success`,
         role: 'model',
-        content: `📸 **Image Parsed & Indexed Successfully:** *${newDoc.name}*\n\n${parsed.summary || 'Content extracted and indexed for Q&A.'}${highlightsText}${amountsText}\n\n*You can now ask questions about this document or compare it against your community bylaws!*`,
+        content: `📄 **Document Parsed & Added to Index:** *${newDoc.name}*\n\n${parsed.summary || 'Content extracted and indexed for Q&A.'}${highlightsText}${amountsText}\n\n*You can now ask questions about this document or cross-reference it with other community records!*`,
         timestamp: Date.now(),
         suggestedQuestions: [
-          `Summarize all motions or key decisions in ${newDoc.name}`,
-          `What financial amounts or dates are mentioned in ${newDoc.name}?`,
-          `Are there any bylaws violations referenced in this document?`
+          `Summarize the key provisions in ${newDoc.name}`,
+          `What dates, figures, or rules are mentioned in ${newDoc.name}?`,
+          `Are there any compliance requirements in ${newDoc.name}?`
         ]
       };
 
       setMessages(prev => [...prev, notificationMsg]);
     } catch (err: any) {
-      console.error('Error uploading/parsing image:', err);
+      console.error('Error uploading/parsing file:', err);
       const errorMsg: ChatMessage = {
-        id: `msg-${Date.now()}-img-err`,
+        id: `msg-${Date.now()}-file-err`,
         role: 'model',
-        content: `❌ Could not parse image: ${err.message || 'Image processing error'}. Please ensure the picture is clear and try again.`,
+        content: `❌ Could not parse file: ${err.message || 'File processing error'}. Please ensure the file format is supported and try again.`,
         timestamp: Date.now(),
         error: true,
       };
       setMessages(prev => [...prev, errorMsg]);
     } finally {
-      setIsUploadingImage(false);
+      setIsUploadingFile(false);
     }
   };
 
@@ -357,8 +578,8 @@ export default function App() {
         headers,
         body: JSON.stringify({
           docId: doc.id,
-          driveFile: !doc.id.startsWith('sample-') && !doc.isImageDoc ? doc : undefined,
-          customDoc: doc.isImageDoc || doc.content ? {
+          driveFile: !doc.id.startsWith('upload-') && !doc.isImageDoc ? doc : undefined,
+          customDoc: doc.isImageDoc || doc.isOfficeDoc || doc.content ? {
             id: doc.id,
             name: doc.name,
             category: doc.category,
@@ -366,6 +587,7 @@ export default function App() {
             summary: doc.summary,
             mimeType: doc.mimeType,
           } : undefined,
+          aiConfig,
         }),
       });
 
@@ -402,7 +624,6 @@ export default function App() {
         headers['Authorization'] = `Bearer ${token}`;
       }
 
-      // Convert history for API
       const apiHistory = updatedHistory
         .filter(m => m.role === 'user' || m.role === 'model')
         .slice(-8)
@@ -411,65 +632,45 @@ export default function App() {
           content: m.content,
         }));
 
-      // Gather drive files to extract if in Drive mode (excluding custom docs which are sent directly)
-      const filesToExtract = !isSampleMode && hasDriveAccess
-        ? driveFiles.filter(f => selectedDocIds.includes(f.id) && !customDocs.some(c => c.id === f.id))
-        : [];
+      const payload = {
+        question: queryText,
+        history: apiHistory,
+        selectedDocIds,
+        filterCategory,
+        driveFilesToExtract: driveFiles.filter(f => selectedDocIds.includes(f.id)),
+        customDocuments: customDocs.filter(c => selectedDocIds.includes(c.id)),
+        aiConfig,
+      };
 
-      // Gather custom docs that are selected
-      const customDocsToSend = customDocs
-        .filter(c => selectedDocIds.length === 0 || selectedDocIds.includes(c.id))
-        .map(c => ({
-          id: c.id,
-          name: c.name,
-          category: c.category,
-          content: c.content || c.snippet || '',
-          summary: c.summary || '',
-          mimeType: c.mimeType,
-        }));
-
-      const res = await fetch('/api/chat', {
+      const response = await fetch('/api/chat', {
         method: 'POST',
         headers,
-        body: JSON.stringify({
-          question: queryText,
-          history: apiHistory.slice(0, -1), // exclude current question which is passed in question field
-          selectedDocIds,
-          useSampleLibrary: isSampleMode,
-          filterCategory,
-          driveFilesToExtract: filesToExtract,
-          customDocuments: customDocsToSend,
-        }),
+        body: JSON.stringify(payload),
       });
 
-      if (res.ok) {
-        const data = await res.json();
-        const aiMessage: ChatMessage = {
-          id: `msg-${Date.now()}-model`,
-          role: 'model',
-          content: data.answer,
-          timestamp: Date.now(),
-          sources: data.sources || [],
-          suggestedQuestions: data.suggestedQuestions || [],
-        };
-        setMessages(prev => [...prev, aiMessage]);
-      } else {
-        const errData = await res.json().catch(() => ({}));
-        const errorMessage: ChatMessage = {
-          id: `msg-${Date.now()}-error`,
-          role: 'model',
-          content: `I encountered an issue processing your question: ${errData.error || 'Server error'}. Please verify your document selection and try again.`,
-          timestamp: Date.now(),
-          error: true,
-        };
-        setMessages(prev => [...prev, errorMessage]);
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.error || 'Failed to get response from HOA AI assistant');
       }
-    } catch (err: any) {
-      console.error('Chat error:', err);
-      const errorMessage: ChatMessage = {
-        id: `msg-${Date.now()}-error`,
+
+      const data = await response.json();
+
+      const assistantMessage: ChatMessage = {
+        id: `msg-${Date.now()}-assistant`,
         role: 'model',
-        content: `Connection error: Could not reach the HOA Document Assistant server. Please check your network connection.`,
+        content: data.answer,
+        sources: data.sources || [],
+        suggestedQuestions: data.suggestedQuestions || [],
+        timestamp: Date.now(),
+      };
+
+      setMessages(prev => [...prev, assistantMessage]);
+    } catch (error: any) {
+      console.error('Chat error:', error);
+      const errorMessage: ChatMessage = {
+        id: `msg-${Date.now()}-err`,
+        role: 'model',
+        content: `I encountered an issue processing your request: **${error.message || 'Unknown error'}**.\n\nPlease check your AI model configuration or try rephrasing your question.`,
         timestamp: Date.now(),
         error: true,
       };
@@ -481,26 +682,41 @@ export default function App() {
 
   const handleClearMessages = () => {
     setMessages([]);
+    saveLocalData('saved_chat_messages', []);
   };
 
   return (
-    <div className="flex flex-col h-screen bg-[#F8FAFC] text-[#1E293B] font-sans overflow-hidden">
-      {/* Top Application Header */}
+    <div className="flex flex-col h-screen bg-[#F8FAFC] text-[#0F172A] overflow-hidden font-sans">
+      {/* Top Navigation Header */}
       <Header
         user={user}
         hasDriveAccess={hasDriveAccess}
         isLoggingIn={isLoggingIn}
         selectedDocsCount={selectedDocIds.length}
         totalDocsCount={activeFilesList.length}
-        isSampleMode={isSampleMode}
+        aiConfig={aiConfig}
+        onOpenAISettings={() => setIsAISettingsOpen(true)}
         onLogin={handleLogin}
         onLogout={handleLogout}
         onRefreshDrive={handleRefreshDrive}
         isRefreshingDrive={isRefreshingDrive}
       />
 
-      {/* Mobile Sidebar Toggle Button */}
-      <div className="lg:hidden bg-white border-b border-[#E2E8F0] px-4 py-2.5 flex items-center justify-between z-20 flex-shrink-0">
+      {/* Indexing Progress Indicator Bar */}
+      {isIndexingFolder && (
+        <div className="bg-blue-600 text-white px-4 py-2 text-xs font-semibold flex items-center justify-between shadow-xs z-30 transition">
+          <div className="flex items-center gap-2">
+            <Loader2 className="w-4 h-4 animate-spin text-white" />
+            <span>{indexingStatusText || 'Indexing and parsing documents across folder tree...'}</span>
+          </div>
+          <span className="text-[10px] bg-blue-700 text-white px-2 py-0.5 rounded uppercase font-bold tracking-wider">
+            Traversing Subfolders
+          </span>
+        </div>
+      )}
+
+      {/* Mobile Top Navigation Tab Bar */}
+      <div className="lg:hidden bg-white border-b border-[#E2E8F0] px-4 py-2.5 flex items-center justify-between z-20 shrink-0">
         <button
           onClick={() => setMobileSidebarOpen(!mobileSidebarOpen)}
           className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#EFF6FF] text-[#2563EB] text-xs font-semibold border border-blue-200 cursor-pointer shadow-2xs"
@@ -509,7 +725,7 @@ export default function App() {
           <span>{mobileSidebarOpen ? 'Close Documents' : `HOA Documents (${selectedDocIds.length} active)`}</span>
         </button>
         <span className="text-xs text-[#64748B] font-semibold uppercase tracking-wider text-[10px]">
-          {isSampleMode ? 'Sample Mode' : 'Drive Mode'}
+          {`Folder: ${currentFolderName}`}
         </span>
       </div>
 
@@ -524,27 +740,27 @@ export default function App() {
           <DriveDocumentBrowser
             files={activeFilesList}
             selectedFileIds={selectedDocIds}
-            isLoading={isLoadingDocs}
+            isLoading={isLoadingDocs || isIndexingFolder}
             hasDriveAccess={hasDriveAccess}
-            isSampleMode={isSampleMode}
             onToggleSelect={handleToggleSelectDoc}
             onSelectAll={handleSelectAllDocs}
             onClearSelection={handleClearSelection}
             onSummarizeDoc={handleSummarizeDoc}
-            onSwitchMode={handleSwitchMode}
             onConnectDrive={handleLogin}
-            onUploadImage={handleUploadImage}
-            isUploadingImage={isUploadingImage}
+            onUploadFile={handleUploadFile}
+            isUploadingFile={isUploadingFile}
             currentFolderId={currentFolderId}
             currentFolderName={currentFolderName}
             folderBreadcrumbs={folderBreadcrumbs}
             availableSubfolders={availableSubfolders}
-            onOpenFolderModal={() => setIsFolderModalOpen(true)}
+            onOpenFolderModal={() => {
+              setMatchingHOAFolders([]);
+              setFolderModalNotice('');
+              setIsFolderModalOpen(true);
+            }}
             onNavigateBreadcrumb={handleNavigateBreadcrumb}
-            onDrillIntoFolder={handleDrillIntoFolder}
             onScopeToFolder={handleSelectFolder}
-            onResetToRoot={handleResetToRoot}
-            isFolderScoped={currentFolderId !== 'root'}
+            onReindexFolder={handleRefreshDrive}
           />
         </div>
 
@@ -562,23 +778,39 @@ export default function App() {
           isLoading={isChatLoading}
           selectedDocsCount={selectedDocIds.length}
           filterCategory={filterCategory}
+          aiConfig={aiConfig}
           onSendMessage={handleSendMessage}
           onClearMessages={handleClearMessages}
           onSelectCategory={setFilterCategory}
           onViewSource={setActiveSourceModal}
-          onUploadImage={handleUploadImage}
-          isUploadingImage={isUploadingImage}
+          onUploadFile={handleUploadFile}
+          isUploadingFile={isUploadingFile}
+          onOpenAISettings={() => setIsAISettingsOpen(true)}
         />
       </div>
+
+      {/* AI Model & Server Settings Modal */}
+      <AISettingsModal
+        isOpen={isAISettingsOpen}
+        onClose={() => setIsAISettingsOpen(false)}
+        config={aiConfig}
+        onSaveConfig={handleSaveAIConfig}
+      />
 
       {/* Folder Selector Modal */}
       <FolderSelectorModal
         isOpen={isFolderModalOpen}
-        onClose={() => setIsFolderModalOpen(false)}
+        onClose={() => {
+          setIsFolderModalOpen(false);
+          setMatchingHOAFolders([]);
+          setFolderModalNotice('');
+        }}
         currentFolderId={currentFolderId}
         currentFolderName={currentFolderName}
         onSelectFolder={handleSelectFolder}
         accessToken={getAccessToken()}
+        matchingHOAFolders={matchingHOAFolders}
+        noticeMessage={folderModalNotice}
       />
 
       {/* Source Excerpt Modal */}

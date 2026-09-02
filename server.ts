@@ -2,9 +2,32 @@ import express from 'express';
 import path from 'path';
 import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
-import { SAMPLE_HOA_DOCUMENTS } from './server/sampleDocuments';
-import { fetchDriveFilesList, fetchDriveFolderTreeAndFiles, extractDocumentContent, fetchDriveFolderInfo, fetchDriveFoldersList, ParsedDoc } from './server/driveParser';
-import { askHOAChatbot, generateDocumentSummary, extractTextAndDataFromImage } from './server/gemini';
+import { 
+  fetchDriveFilesList, 
+  extractDocumentContent, 
+  fetchDriveFolderInfo, 
+  fetchDriveFoldersList, 
+  indexAndParseFolder,
+  searchHOAFolders,
+  getActiveIndexedDocs,
+  getActiveFolderMeta,
+  clearActiveFolderIndex,
+  categorizeHOADocument,
+  ParsedDoc 
+} from './server/driveParser';
+import { 
+  parseWordDocument, 
+  parseExcelSpreadsheet, 
+  parsePowerPointPresentation, 
+  parsePdfBuffer 
+} from './server/officeParser';
+import { 
+  askHOAChatbot, 
+  generateDocumentSummary, 
+  extractTextAndDataFromImage, 
+  testAIConnection,
+  AIConfig 
+} from './server/gemini';
 
 dotenv.config();
 
@@ -12,7 +35,7 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json({ limit: '30mb' }));
+  app.use(express.json({ limit: '50mb' }));
 
   // API Route: Health check
   app.get('/api/health', (req, res) => {
@@ -23,25 +46,117 @@ async function startServer() {
     });
   });
 
-  // API Route: Get pre-loaded sample HOA document library
-  app.get('/api/documents/sample', (req, res) => {
-    const list = SAMPLE_HOA_DOCUMENTS.map(doc => ({
-      id: doc.id,
-      name: doc.name,
-      category: doc.category,
-      mimeType: doc.mimeType,
-      modifiedTime: doc.modifiedTime,
-      summary: doc.summary,
-      contentLength: doc.content.length,
-      isSample: true,
-    }));
-    res.json({ documents: list });
+  // API Route: Test connection to Gemini or Private AI server
+  app.post('/api/ai/test-connection', async (req, res) => {
+    try {
+      const config: AIConfig = req.body.aiConfig || req.body;
+      const result = await testAIConnection(config);
+      res.json(result);
+    } catch (err: any) {
+      console.error('Error testing AI connection:', err);
+      res.status(500).json({ success: false, message: err.message || 'Failed to test AI server connection' });
+    }
   });
 
-  // API Route: Direct Parse & Index Image (JPG/PNG/WEBP of meetings or financials)
+  // API Route: Direct Parse & Index File Uploads (MS Word, Excel, PPT, PDF, JPG/PNG, Text)
+  app.post('/api/documents/parse-file', async (req, res) => {
+    try {
+      const { fileBase64, mimeType, fileName, aiConfig } = req.body;
+      if (!fileBase64) {
+        return res.status(400).json({ error: 'Missing fileBase64 in request body' });
+      }
+
+      const cleanBase64 = fileBase64.includes(';base64,')
+        ? fileBase64.split(';base64,')[1]
+        : fileBase64;
+      const buffer = Buffer.from(cleanBase64, 'base64');
+      const lowerName = (fileName || 'document').toLowerCase();
+      let detectedCategory = categorizeHOADocument(fileName || '');
+      let textContent = '';
+      let docSummary: string | undefined = undefined;
+      let keyHighlights: string[] = [];
+      let importantDatesOrAmounts: string[] = [];
+
+      if (
+        lowerName.endsWith('.docx') || 
+        lowerName.endsWith('.doc') || 
+        mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || 
+        mimeType === 'application/msword'
+      ) {
+        // Word document
+        const parsed = await parseWordDocument(buffer);
+        textContent = parsed.text;
+        docSummary = `MS Word document ${fileName} (${parsed.text.length} characters parsed).`;
+      } else if (
+        lowerName.endsWith('.xlsx') || 
+        lowerName.endsWith('.xls') || 
+        lowerName.endsWith('.csv') ||
+        mimeType === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' || 
+        mimeType === 'application/vnd.ms-excel'
+      ) {
+        // Excel spreadsheet
+        const parsed = await parseExcelSpreadsheet(buffer);
+        textContent = parsed.text;
+        docSummary = `MS Excel spreadsheet ${fileName} (${parsed.pageOrSheetCount || 1} sheet(s) parsed).`;
+        if (parsed.tables && parsed.tables.length > 0) {
+          keyHighlights = parsed.tables;
+        }
+      } else if (
+        lowerName.endsWith('.pptx') || 
+        lowerName.endsWith('.ppt') || 
+        mimeType === 'application/vnd.openxmlformats-officedocument.presentationml.presentation' || 
+        mimeType === 'application/vnd.ms-powerpoint'
+      ) {
+        // PowerPoint presentation
+        const parsed = await parsePowerPointPresentation(buffer);
+        textContent = parsed.text;
+        docSummary = `MS PowerPoint presentation ${fileName} parsed.`;
+      } else if (mimeType === 'application/pdf' || lowerName.endsWith('.pdf')) {
+        // PDF document
+        const parsed = await parsePdfBuffer(buffer);
+        textContent = parsed.text;
+        docSummary = `PDF document ${fileName} parsed.`;
+      } else if (mimeType?.startsWith('image/') || lowerName.match(/\.(jpe?g|png|webp|gif|bmp)$/i)) {
+        // Image document with OCR
+        const result = await extractTextAndDataFromImage(cleanBase64, mimeType || 'image/jpeg', fileName || 'Scanned Document.jpg', aiConfig);
+        textContent = result.textContent;
+        docSummary = result.summary;
+        detectedCategory = result.category;
+        keyHighlights = result.keyHighlights;
+        importantDatesOrAmounts = result.importantDatesOrAmounts;
+      } else {
+        // Plain text / markdown fallback
+        textContent = buffer.toString('utf-8');
+        docSummary = `Text document ${fileName} parsed.`;
+      }
+
+      const docId = 'upload-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7);
+      
+      res.json({
+        id: docId,
+        name: fileName || 'Uploaded Document',
+        category: detectedCategory,
+        mimeType: mimeType || 'application/octet-stream',
+        modifiedTime: new Date().toISOString(),
+        content: textContent,
+        summary: docSummary,
+        keyHighlights,
+        importantDatesOrAmounts,
+        extractedLength: textContent.length,
+        snippet: textContent.slice(0, 300) + '...',
+        isOfficeDoc: lowerName.endsWith('.docx') || lowerName.endsWith('.doc') || lowerName.endsWith('.xlsx') || lowerName.endsWith('.xls') || lowerName.endsWith('.pptx'),
+        isImageDoc: mimeType?.startsWith('image/') || !!lowerName.match(/\.(jpe?g|png|webp|gif|bmp)$/i),
+      });
+    } catch (error: any) {
+      console.error('Error in /api/documents/parse-file:', error);
+      res.status(500).json({ error: error.message || 'Failed to parse uploaded file' });
+    }
+  });
+
+  // Legacy route alias for parse-image
   app.post('/api/documents/parse-image', async (req, res) => {
     try {
-      const { imageBase64, mimeType, fileName } = req.body;
+      const { imageBase64, mimeType, fileName, aiConfig } = req.body;
       if (!imageBase64) {
         return res.status(400).json({ error: 'Missing imageBase64 in request body' });
       }
@@ -49,7 +164,8 @@ async function startServer() {
       const result = await extractTextAndDataFromImage(
         imageBase64,
         mimeType || 'image/jpeg',
-        fileName || 'Scanned Document.jpg'
+        fileName || 'Scanned Document.jpg',
+        aiConfig
       );
 
       const docId = 'img-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7);
@@ -70,11 +186,83 @@ async function startServer() {
       });
     } catch (error: any) {
       console.error('Error in /api/documents/parse-image:', error);
-      res.status(500).json({ error: error.message || 'Failed to parse image with Gemini' });
+      res.status(500).json({ error: error.message || 'Failed to parse image with AI OCR' });
     }
   });
 
-  // API Route: List Google Drive files with user Bearer token (recursively indexes selected folder)
+  // API Route: Search for HOA folder(s) in Google Drive
+  app.get('/api/drive/search-hoa-folders', async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({ error: 'Missing or invalid Google OAuth Authorization header' });
+      }
+      const accessToken = authHeader.split(' ')[1];
+      const matchingFolders = await searchHOAFolders(accessToken);
+      res.json({ folders: matchingFolders });
+    } catch (error: any) {
+      console.error('Error in /api/drive/search-hoa-folders:', error);
+      res.status(500).json({ error: error.message || 'Failed to search for HOA folder in Google Drive' });
+    }
+  });
+
+  // API Route: Index and Parse all files in a folder and all its subfolders with incremental caching
+  app.post('/api/drive/index-folder', async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({ error: 'Missing or invalid Google OAuth Authorization header' });
+      }
+      const accessToken = authHeader.split(' ')[1];
+      const { folderId, folderName, forceFullReindex, aiConfig } = req.body;
+      if (!folderId) {
+        return res.status(400).json({ error: 'Missing folderId parameter in request body' });
+      }
+
+      const result = await indexAndParseFolder(accessToken, folderId, folderName || 'Selected Folder', !!forceFullReindex, aiConfig);
+      res.json(result);
+    } catch (error: any) {
+      console.error('Error in /api/drive/index-folder:', error);
+      res.status(500).json({ error: error.message || 'Failed to index and parse folder and subfolders' });
+    }
+  });
+
+  // API Route: Get current active indexed status
+  app.get('/api/drive/indexed-status', (req, res) => {
+    const meta = getActiveFolderMeta();
+    const docs = getActiveIndexedDocs();
+    res.json({
+      meta,
+      documents: docs.map(d => ({
+        id: d.id,
+        name: d.name,
+        category: d.category,
+        mimeType: d.mimeType,
+        modifiedTime: d.modifiedTime,
+        contentLength: d.content ? d.content.length : 0,
+        summary: d.summary,
+        keyHighlights: d.keyHighlights || [],
+        importantDatesOrAmounts: d.importantDatesOrAmounts || [],
+        snippet: d.content ? (d.content.slice(0, 300) + '...') : '',
+        folderId: d.folderId,
+        folderName: d.folderName,
+        folderPath: d.folderPath,
+        webViewLink: d.webViewLink,
+        iconLink: d.iconLink,
+        isHOAKeywordMatch: d.isHOAKeywordMatch,
+        isOfficeDoc: d.isOfficeDoc,
+        isImageDoc: d.isImageDoc,
+      })),
+    });
+  });
+
+  // API Route: Clear indexed folder documents
+  app.post('/api/drive/clear-index', (req, res) => {
+    clearActiveFolderIndex();
+    res.json({ status: 'cleared' });
+  });
+
+  // API Route: List Google Drive files with user Bearer token
   app.get('/api/drive/files', async (req, res) => {
     try {
       const authHeader = req.headers.authorization;
@@ -82,11 +270,11 @@ async function startServer() {
         return res.status(401).json({ error: 'Missing or invalid Google OAuth Authorization header' });
       }
       const accessToken = authHeader.split(' ')[1];
-      const folderId = (req.query.folderId as string) || 'root';
+      const folderId = req.query.folderId as string | undefined;
       const searchQuery = req.query.q as string | undefined;
 
-      const result = await fetchDriveFolderTreeAndFiles(accessToken, folderId, searchQuery);
-      res.json(result);
+      const files = await fetchDriveFilesList(accessToken, folderId, searchQuery);
+      res.json({ files });
     } catch (error: any) {
       console.error('Error in /api/drive/files:', error);
       res.status(500).json({ error: error.message || 'Failed to fetch Google Drive files' });
@@ -166,19 +354,19 @@ async function startServer() {
         question,
         history = [],
         selectedDocIds = [],
-        useSampleLibrary = false,
         filterCategory = 'all',
         driveFilesToExtract = [],
         customDocuments = [],
+        aiConfig,
       } = req.body;
 
       if (!question || typeof question !== 'string') {
         return res.status(400).json({ error: 'Missing question parameter' });
       }
 
-      let documentsToQuery: Array<ParsedDoc | typeof SAMPLE_HOA_DOCUMENTS[0]> = [];
+      let documentsToQuery: ParsedDoc[] = [];
 
-      // Custom/Uploaded parsed documents (such as OCR-extracted JPG images)
+      // Custom/Uploaded parsed documents (such as Word, Excel, PDF, or OCR-extracted JPG images)
       if (Array.isArray(customDocuments) && customDocuments.length > 0) {
         for (const cDoc of customDocuments) {
           if (selectedDocIds.length === 0 || selectedDocIds.includes(cDoc.id)) {
@@ -187,31 +375,29 @@ async function startServer() {
         }
       }
 
-      // If user has sample docs enabled or requested
-      if (useSampleLibrary) {
-        const sampleDocs = SAMPLE_HOA_DOCUMENTS.filter(doc => {
-          if (selectedDocIds.length > 0 && selectedDocIds.some((id: string) => id.startsWith('sample-'))) {
-            return selectedDocIds.includes(doc.id);
+      // Check active indexed folder documents from Drive
+      const indexedDocs = getActiveIndexedDocs();
+      if (indexedDocs.length > 0) {
+        for (const doc of indexedDocs) {
+          if (selectedDocIds.length === 0 || selectedDocIds.includes(doc.id)) {
+            documentsToQuery.push(doc);
           }
-          return true;
-        });
-        documentsToQuery.push(...sampleDocs);
-      }
-
-      // If user has connected Google Drive and selected or provided Drive files
-      const authHeader = req.headers.authorization;
-      if (authHeader && authHeader.startsWith('Bearer ') && driveFilesToExtract.length > 0) {
-        const accessToken = authHeader.split(' ')[1];
-        for (const file of driveFilesToExtract) {
-          // If specific docs were selected, only extract those
-          if (selectedDocIds.length > 0 && !selectedDocIds.includes(file.id)) {
-            continue;
-          }
-          try {
-            const parsed = await extractDocumentContent(accessToken, file);
-            documentsToQuery.push(parsed);
-          } catch (docErr) {
-            console.error(`Failed to extract text for ${file.name}:`, docErr);
+        }
+      } else if (driveFilesToExtract.length > 0) {
+        // If user provided ad-hoc Drive files
+        const authHeader = req.headers.authorization;
+        if (authHeader && authHeader.startsWith('Bearer ')) {
+          const accessToken = authHeader.split(' ')[1];
+          for (const file of driveFilesToExtract) {
+            if (selectedDocIds.length > 0 && !selectedDocIds.includes(file.id)) {
+              continue;
+            }
+            try {
+              const parsed = await extractDocumentContent(accessToken, file);
+              documentsToQuery.push(parsed);
+            } catch (docErr) {
+              console.error(`Failed to extract text for ${file.name}:`, docErr);
+            }
           }
         }
       }
@@ -229,6 +415,7 @@ async function startServer() {
         history,
         documents: documentsToQuery,
         filterCategory,
+        aiConfig,
       });
 
       res.json(result);
@@ -236,11 +423,11 @@ async function startServer() {
       console.error('Error in /api/chat:', error);
       res.status(500).json({
         error: error.message || 'Internal server error processing question',
-        answer: 'I encountered an issue querying the HOA documents. Please check your connection or try again.',
+        answer: 'I encountered an issue querying the HOA documents. Please verify your selected folder or AI model configuration.',
         sources: [],
         suggestedQuestions: [
           'What are the leasing restrictions?',
-          'What is the 2026 dues assessment?',
+          'What is the current dues assessment?',
           'How do I submit an ARC application?'
         ]
       });
@@ -250,14 +437,18 @@ async function startServer() {
   // API Route: Document Summarizer
   app.post('/api/documents/summarize', async (req, res) => {
     try {
-      const { docId, driveFile, customDoc } = req.body;
+      const { docId, driveFile, customDoc, aiConfig } = req.body;
       let targetDoc: any = null;
 
       if (customDoc && customDoc.content) {
         targetDoc = customDoc;
-      } else if (docId && docId.startsWith('sample-')) {
-        targetDoc = SAMPLE_HOA_DOCUMENTS.find(d => d.id === docId);
-      } else if (driveFile) {
+      } else if (docId) {
+        // Look up in active indexed documents first
+        const activeDocs = getActiveIndexedDocs();
+        targetDoc = activeDocs.find(d => d.id === docId);
+      }
+      
+      if (!targetDoc && driveFile) {
         const authHeader = req.headers.authorization;
         if (!authHeader || !authHeader.startsWith('Bearer ')) {
           return res.status(401).json({ error: 'Missing Authorization header' });
@@ -270,7 +461,7 @@ async function startServer() {
         return res.status(404).json({ error: 'Document not found' });
       }
 
-      const summaryData = await generateDocumentSummary(targetDoc);
+      const summaryData = await generateDocumentSummary(targetDoc, aiConfig);
       res.json({ document: targetDoc.name, summary: summaryData });
     } catch (error: any) {
       console.error('Error in /api/documents/summarize:', error);
